@@ -9,9 +9,12 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 app = FastAPI(title="Order Service")
 
 # Config (could be env-driven)
-INVENTORY_URL = "http://inventory_service:8006"
-PAYMENT_URL = "http://payment_service:8005"
-SHIPPING_URL = "http://shipping_service:8007"
+# INVENTORY_URL = "http://inventory_service:8006"
+# PAYMENT_URL = "http://payment_service:8005"
+# SHIPPING_URL = "http://shipping_service:8007"
+INVENTORY_URL = "http://localhost:8006"
+PAYMENT_URL = "http://localhost:8005"
+SHIPPING_URL = "http://localhost:8007"
 
 class Address(BaseModel):
     line1: str
@@ -43,13 +46,13 @@ IDEMPOTENCY: Dict[str, str] = {}  # Idempotency-Key -> orderId
 def health():
     return {"status": "ok", "service": "Order Service"}
 
-@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.2, min=0.2, max=2), retry=retry_if_exception_type(httpx.RequestError))
+# @retry(reraise=True, stop=stop_after_attempt(1), wait=wait_exponential(multiplier=0.2, min=0.2, max=2), retry=retry_if_exception_type(httpx.RequestError))
 async def post_json(client: httpx.AsyncClient, url: str, json_payload: dict, headers: dict | None = None):
     r = await client.post(url, json=json_payload, headers=headers, timeout=5.0)
     r.raise_for_status()
     return r.json()
 
-@retry(reraise=True, stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.2, min=0.2, max=2), retry=retry_if_exception_type(httpx.RequestError))
+# @retry(reraise=True, stop=stop_after_attempt(1), wait=wait_exponential(multiplier=0.2, min=0.2, max=2), retry=retry_if_exception_type(httpx.RequestError))
 async def post_nojson(client: httpx.AsyncClient, url: str, headers: dict | None = None):
     r = await client.post(url, headers=headers, timeout=5.0)
     r.raise_for_status()
@@ -79,10 +82,19 @@ async def create_order(payload: CreateOrderRequest, Idempotency_Key: Optional[st
         try:
             resv = await post_json(client, f"{INVENTORY_URL}/reserve", {"orderId": oid, "items": [it.model_dump() for it in order.items]})
             order.reservationId = resv["id"]
+        except httpx.HTTPStatusError as e:
+            # Extract detail from response
+            try:
+                detail = e.response.json().get("detail", str(e))
+            except Exception:
+                detail = str(e)
+            order.status = "cancelled"
+            ORDERS[oid] = order
+            raise HTTPException(409, detail=f"Inventory reservation failed: {detail}")
         except Exception as e:
             order.status = "cancelled"
             ORDERS[oid] = order
-            raise HTTPException(409, detail=f"Inventory reservation failed: {e}")
+            raise HTTPException(409, detail=f"Inventory reservation failed: {str(e)}")
 
         # Step 2: Authorize Payment
         grand_total = sum([it.qty * it.price for it in order.items])
