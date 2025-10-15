@@ -41,6 +41,6 @@ jobs:
       - name: Deploy to Minikube
         run: |
           export DOCKER_HUB_USERNAME=${{ secrets.DOCKER_HUB_USERNAME }}
-          envsubst < k8s/order-service-deployment-template.yaml > k8s/order-service-deployment.yaml
-          kubectl apply -f k8s/order-service-deployment.yaml
-          kubectl apply -f k8s/order-service-service.yaml
+          envsubst < k8s/order-deployment-template.yaml > k8s/order-service-deployment.yaml
+          kubectl apply -f k8s/order-deployment-template.yaml
+          kubectl apply -f k8s/order-service-template.yaml
