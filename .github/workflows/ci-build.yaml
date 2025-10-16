@@ -1,8 +1,8 @@
 name: CI - Build and Push Order Service Image
 
 on:
-  push:
-    branches: [ main ]
+  # push:
+    # branches: [ main ]
   pull_request:
     branches: [ main ]
 
