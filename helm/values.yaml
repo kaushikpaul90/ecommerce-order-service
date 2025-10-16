@@ -1,0 +1,14 @@
+replicaCount: 2
+version: 0.1.0
+
+image:
+  repository: "${DOCKER_HUB_USERNAME}/order-service"
+  tag: latest
+  pullPolicy: Always
+
+service:
+  type: NodePort
+  port: 8080
+  nodePort: 30001
+
+containerPort: 8080

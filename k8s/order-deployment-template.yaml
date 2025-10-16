@@ -15,5 +15,6 @@ spec:
       containers:
       - name: order-service
         image: ${DOCKER_HUB_USERNAME}/order-service:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 8080
