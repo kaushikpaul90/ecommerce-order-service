@@ -64,7 +64,7 @@ helm upgrade --install "$SERVICE_NAME" "$CHART_DIR" -f "$CHART_DIR/values-resolv
 # 6. Wait for pods to be ready
 # --------------------------------------------------------------------
 echo "⏳ Waiting for $SERVICE_NAME pods to become ready..."
-kubectl rollout status deployment/$SERVICE_NAME --timeout=15s || {
+kubectl rollout status deployment/$SERVICE_NAME --timeout=30s || {
   echo "⚠️ Deployment did not complete successfully. Check pod logs below:"
   kubectl get pods
   kubectl describe deployment $SERVICE_NAME

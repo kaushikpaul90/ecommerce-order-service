@@ -10,6 +10,6 @@ spec:
     app: {{ .Chart.Name }}
   ports:
     - protocol: TCP
-      port: {{ .Values.service.port }}
-      targetPort: {{ .Values.containerPort }}
-      nodePort: {{ .Values.service.nodePort }}
+      port: {{ .Values.service.port }}          # cluster-internal port
+      targetPort: {{ .Values.containerPort }}   # actual app (container) port
+      nodePort: {{ .Values.service.nodePort }}  # external (Minikube) port

@@ -10,4 +10,4 @@ service:
   port: 8080
   nodePort: 30001
 
-containerPort: 8080
+containerPort: 8004
