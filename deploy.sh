@@ -64,12 +64,7 @@ helm upgrade --install "$SERVICE_NAME" "$CHART_DIR" -f "$CHART_DIR/values-resolv
 # 6. Wait for pods to be ready
 # --------------------------------------------------------------------
 echo "⏳ Waiting for $SERVICE_NAME pods to become ready..."
-kubectl rollout status deployment/$SERVICE_NAME --timeout=30s || {
-  echo "⚠️ Deployment did not complete successfully. Check pod logs below:"
-  kubectl get pods
-  kubectl describe deployment $SERVICE_NAME
-  exit 1
-}
+kubectl rollout status deployment/$SERVICE_NAME
 
 # --------------------------------------------------------------------
 # 7. Display service URL
@@ -77,25 +72,6 @@ kubectl rollout status deployment/$SERVICE_NAME --timeout=30s || {
 echo ""
 echo "🌐 Access $SERVICE_NAME via the following URL:"
 minikube service $SERVICE_NAME --url
-
-# echo "📦 Applying Kubernetes manifests..."
-
-# # Apply all manifests
-# kubectl apply -f k8s/order-deployment-template.yaml
-# kubectl apply -f k8s/order-service-template.yaml
-
-# echo ${DOCKER_HUB_USERNAME}
-
-# echo "⏳ Waiting for all pods to become ready..."
-# kubectl wait --for=condition=available --timeout=15s deployment/order-service
-
-# echo "✅ Order service deployed successfully!"
-
-# echo ""
-# echo "🌐 Access Order service via the following URL:"
-
-# # Retrieve and print service URL
-# echo "Order service: $(minikube service order-service --url)"
 
 echo ""
 echo "✅ $SERVICE_NAME deployed successfully!"
