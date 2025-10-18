@@ -12,9 +12,11 @@ app = FastAPI(title="Order Service")
 # INVENTORY_URL = "http://inventory_service:8006"
 # PAYMENT_URL = "http://payment_service:8005"
 # SHIPPING_URL = "http://shipping_service:8007"
+
 # INVENTORY_URL = "http://localhost:8006"
 # PAYMENT_URL = "http://localhost:8005"
 # SHIPPING_URL = "http://localhost:8007"
+
 INVENTORY_URL = "http://192.168.49.2:30002"
 PAYMENT_URL = "http://192.168.49.2:30003"
 SHIPPING_URL = "http://192.168.49.2:30004"
