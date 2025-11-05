@@ -17,9 +17,9 @@ app = FastAPI(title="Order Service")
 # PAYMENT_URL = "http://localhost:8005"
 # SHIPPING_URL = "http://localhost:8007"
 
-INVENTORY_URL = "http://192.168.49.2:30002"
-PAYMENT_URL = "http://192.168.49.2:30003"
-SHIPPING_URL = "http://192.168.49.2:30004"
+INVENTORY_URL = "http://192.168.105.2:30002"
+PAYMENT_URL = "http://192.168.105.2:30003"
+SHIPPING_URL = "http://192.168.105.2:30004"
 
 class Address(BaseModel):
     line1: str
@@ -44,6 +44,12 @@ class Order(BaseModel):
     chargeId: Optional[str] = None
     shipmentId: Optional[str] = None
 
+class CreateOrderRequest(BaseModel):
+    userId: Optional[str] = None
+    address: Address
+    currency: str = "INR"
+    items: List[OrderItem]
+
 ORDERS: Dict[str, Order] = {}
 IDEMPOTENCY: Dict[str, str] = {}  # Idempotency-Key -> orderId
 
@@ -62,12 +68,6 @@ async def post_nojson(client: httpx.AsyncClient, url: str, headers: dict | None 
     r = await client.post(url, headers=headers, timeout=5.0)
     r.raise_for_status()
     return r.json() if r.content else {}
-
-class CreateOrderRequest(BaseModel):
-    userId: Optional[str] = None
-    address: Address
-    currency: str = "INR"
-    items: List[OrderItem]
 
 @app.post("/orders", response_model=Order)
 async def create_order(payload: CreateOrderRequest, Idempotency_Key: Optional[str] = Header(default=None, alias="Idempotency-Key")):
