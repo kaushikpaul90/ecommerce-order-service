@@ -1,25 +1,23 @@
-
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import httpx
 import uuid
+import os
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 app = FastAPI(title="Order Service")
 
-# Config (could be env-driven)
-# INVENTORY_URL = "http://inventory_service:8006"
-# PAYMENT_URL = "http://payment_service:8005"
-# SHIPPING_URL = "http://shipping_service:8007"
+# Config via environment variables
+# INVENTORY_SERVICE_URL = os.getenv("INVENTORY_URL", "http://192.168.105.2:30002")
+# PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://192.168.105.2:30003")
+# SHIPPING_SERVICE_URL = os.getenv("SHIPPING_URL", "http://192.168.105.2:30004")
+# DATABASE_SERVICE_URL = os.getenv("DATABASE_SERVICE_URL", "http://localhost:8000")
 
-# INVENTORY_URL = "http://localhost:8006"
-# PAYMENT_URL = "http://localhost:8005"
-# SHIPPING_URL = "http://localhost:8007"
-
-INVENTORY_URL = "http://192.168.105.2:30002"
-PAYMENT_URL = "http://192.168.105.2:30003"
-SHIPPING_URL = "http://192.168.105.2:30004"
+INVENTORY_SERVICE_URL = os.getenv("INVENTORY_URL", "http://localhost:8006")
+PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://192.168.105.2:30003")
+SHIPPING_SERVICE_URL = os.getenv("SHIPPING_URL", "http://192.168.105.2:30004")
+DATABASE_SERVICE_URL = os.getenv("DATABASE_SERVICE_URL", "http://localhost:8000")
 
 class Address(BaseModel):
     line1: str
@@ -31,6 +29,12 @@ class OrderItem(BaseModel):
     sku: str
     qty: int
     price: float
+
+class CreateOrderRequest(BaseModel):
+    userId: Optional[str] = None
+    address: Address
+    currency: str = "INR"
+    items: List[OrderItem]
 
 class Order(BaseModel):
     id: str
@@ -44,125 +48,148 @@ class Order(BaseModel):
     chargeId: Optional[str] = None
     shipmentId: Optional[str] = None
 
-class CreateOrderRequest(BaseModel):
-    userId: Optional[str] = None
-    address: Address
-    currency: str = "INR"
-    items: List[OrderItem]
-
-ORDERS: Dict[str, Order] = {}
 IDEMPOTENCY: Dict[str, str] = {}  # Idempotency-Key -> orderId
 
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "Order Service"}
 
-# @retry(reraise=True, stop=stop_after_attempt(1), wait=wait_exponential(multiplier=0.2, min=0.2, max=2), retry=retry_if_exception_type(httpx.RequestError))
-async def post_json(client: httpx.AsyncClient, url: str, json_payload: dict, headers: dict | None = None):
-    r = await client.post(url, json=json_payload, headers=headers, timeout=5.0)
-    r.raise_for_status()
-    return r.json()
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-# @retry(reraise=True, stop=stop_after_attempt(1), wait=wait_exponential(multiplier=0.2, min=0.2, max=2), retry=retry_if_exception_type(httpx.RequestError))
-async def post_nojson(client: httpx.AsyncClient, url: str, headers: dict | None = None):
-    r = await client.post(url, headers=headers, timeout=5.0)
-    r.raise_for_status()
-    return r.json() if r.content else {}
+def maybe_retry(func):
+    if DEBUG_MODE:
+        return func  # No retry
+    return retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5),
+        retry=retry_if_exception_type(httpx.HTTPError)
+    )(func)
 
-@app.post("/orders", response_model=Order)
-async def create_order(payload: CreateOrderRequest, Idempotency_Key: Optional[str] = Header(default=None, alias="Idempotency-Key")):
-    # Idempotency: if seen before, return existing order
-    if Idempotency_Key and Idempotency_Key in IDEMPOTENCY:
-        oid = IDEMPOTENCY[Idempotency_Key]
-        return ORDERS[oid]
+# @maybe_retry
+# @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5), retry=retry_if_exception_type(httpx.HTTPError))
+async def call_service(client: httpx.AsyncClient, method: str, url: str, json: Any = None, headers: dict | None = None):
+    resp = await client.request(method, url, json=json, headers=headers, timeout=10.0)
+    resp.raise_for_status()
+    if resp.content:
+        return resp.json()
+    return None
+
+@app.post("/orders", response_model=Order, status_code=201)
+async def create_order(payload: CreateOrderRequest, x_idempotency_key: Optional[str] = Header(None)):
+    # Idempotency check (simple in-memory)
+    if x_idempotency_key and x_idempotency_key in IDEMPOTENCY:
+        oid = IDEMPOTENCY[x_idempotency_key]
+        # fetch from DB
+        async with httpx.AsyncClient() as c:
+            r = await call_service(c, "GET", f"{DATABASE_SERVICE_URL}/orders/{oid}")
+        return r
 
     oid = str(uuid.uuid4())
-    order = Order(id=oid, userId=payload.userId, address=payload.address, currency=payload.currency, items=payload.items, status="created")
-    ORDERS[oid] = order
-    if Idempotency_Key:
-        IDEMPOTENCY[Idempotency_Key] = oid
+    order = {
+        "id": oid,
+        "userId": payload.userId or "anonymous",
+        "address": {
+            "line1": payload.address.line1 if payload.address and hasattr(payload.address, "line1") else "",
+            "city": payload.address.city if payload.address and hasattr(payload.address, "city") else "",
+            "country": getattr(payload.address, "country", "IN") or "IN",
+            "postalCode": getattr(payload.address, "postalCode", "") or "",
+            "zipcode": getattr(payload.address, "postalCode", "") or "",  # keep for backward compatibility
+        },
+        "items": [it.dict() for it in payload.items],
+        "total": sum(it.qty * it.price for it in payload.items),
+        "currency": getattr(payload, "currency", "INR") or "INR",
+        "status": "created",
+    }
 
+    # persist to database
     async with httpx.AsyncClient() as client:
-        # Step 1: Reserve Inventory
-        try:
-            resv = await post_json(client, f"{INVENTORY_URL}/reserve", {"orderId": oid, "items": [it.model_dump() for it in order.items]})
-            order.reservationId = resv["id"]
-        except httpx.HTTPStatusError as e:
-            # Extract detail from response
-            try:
-                detail = e.response.json().get("detail", str(e))
-            except Exception:
-                detail = str(e)
-            order.status = "cancelled"
-            ORDERS[oid] = order
-            raise HTTPException(409, detail=f"Inventory reservation failed: {detail}")
-        except Exception as e:
-            order.status = "cancelled"
-            ORDERS[oid] = order
-            raise HTTPException(409, detail=f"Inventory reservation failed: {str(e)}")
+        await call_service(client, "POST", f"{DATABASE_SERVICE_URL}/orders", json=order)
 
-        # Step 2: Authorize Payment
-        grand_total = sum([it.qty * it.price for it in order.items])
-        try:
-            intent = await post_json(client, f"{PAYMENT_URL}/intents", {"orderId": oid, "amount": grand_total, "currency": order.currency}, headers={"Idempotency-Key": f"order:{oid}:intent"})
-            order.paymentIntentId = intent["id"]
-            intent = await post_nojson(client, f"{PAYMENT_URL}/intents/{order.paymentIntentId}/confirm")
-        except Exception as e:
-            # Compensate reservation
-            if order.reservationId:
+    if x_idempotency_key:
+        IDEMPOTENCY[x_idempotency_key] = oid
+
+    reservation_id = None
+
+    # attempt to finalize: reserve inventory, process payment, create shipment
+    try:
+        async with httpx.AsyncClient() as client:
+            # Reserve inventory — inventory service returns the reservation (with id)
+            inv_payload = {"orderId": oid, "items": [it.dict() for it in payload.items]}
+            try:
+                inv_resp = await call_service(client, "POST", f"{INVENTORY_SERVICE_URL}/reserve", json=inv_payload)
+                reservation_id = inv_resp.get("id") if isinstance(inv_resp, dict) else None
+            except httpx.HTTPStatusError as e:
+                # Upstream returned non-2xx (e.g. 409 Conflict for insufficient stock)
+                status = e.response.status_code if e.response is not None else 502
                 try:
-                    await post_nojson(client, f"{INVENTORY_URL}/reservations/{order.reservationId}/release")
+                    upstream_detail = e.response.json().get("detail", e.response.text) if e.response is not None else str(e)
                 except Exception:
-                    pass
-            order.status = "cancelled"
-            ORDERS[oid] = order
-            raise HTTPException(402, detail=f"Payment authorization failed: {e}")
+                    upstream_detail = e.response.text if e.response is not None else str(e)
 
-        # Step 3: Create Shipment
-        try:
-            shp = await post_json(client, f"{SHIPPING_URL}/shipments", {"orderId": oid, "address": order.address.model_dump(), "items": [it.model_dump() for it in order.items]})
-            order.shipmentId = shp["id"]
-        except Exception as e:
-            # Compensate: void payment (simulate refund path) + release inventory
-            if order.paymentIntentId:
-                # nothing to void in this demo, but keep placeholder
-                pass
-            if order.reservationId:
+                # Cancel the order in DB (best-effort)
+                order["status"] = "cancelled"
                 try:
-                    await post_nojson(client, f"{INVENTORY_URL}/reservations/{order.reservationId}/release")
+                    await call_service(client, "PUT", f"{DATABASE_SERVICE_URL}/orders/{oid}", json=order)
                 except Exception:
+                    # ignore DB update failures here to avoid masking upstream error
                     pass
-            order.status = "cancelled"
-            ORDERS[oid] = order
-            raise HTTPException(409, detail=f"Shipping creation failed: {e}")
 
-        # Step 4: Commit Inventory & Capture Payment
-        try:
-            await post_nojson(client, f"{INVENTORY_URL}/reservations/{order.reservationId}/commit")
-            charge = await post_nojson(client, f"{PAYMENT_URL}/intents/{order.paymentIntentId}/capture")
-            order.chargeId = charge.get("id")
-        except Exception as e:
-            # Compensate: refund and release inventory (best effort)
-            try:
-                if order.chargeId:
-                    await post_nojson(client, f"{PAYMENT_URL}/charges/{order.chargeId}/refund")
-            except Exception:
-                pass
-            try:
-                await post_nojson(client, f"{INVENTORY_URL}/reservations/{order.reservationId}/release")
-            except Exception:
-                pass
-            order.status = "cancelled"
-            ORDERS[oid] = order
-            raise HTTPException(500, detail=f"Finalization failed: {e}")
+                # Propagate client errors (4xx) as-is to the API caller
+                if 400 <= status < 500:
+                    raise HTTPException(status_code=status, detail=upstream_detail)
+                # For upstream 5xx, return 502 Bad Gateway
+                raise HTTPException(status_code=502, detail=f"Upstream error from inventory service: {upstream_detail}")
 
-    order.status = "completed"
-    ORDERS[oid] = order
+            # Process payment
+            pay_payload = {"id": str(uuid.uuid4()), "order_id": oid, "amount": order["total"], "status": "pending"}
+            await call_service(client, "POST", f"{PAYMENT_SERVICE_URL}/payments", json=pay_payload)
+
+            # Create shipment
+            ship_payload = {"id": str(uuid.uuid4()), "order_id": oid, "address": payload.address.dict(), "items": [it.dict() for it in payload.items], "status": "created"}
+            await call_service(client, "POST", f"{SHIPPING_SERVICE_URL}/shipments", json=ship_payload)
+
+            # All succeeded -> mark order completed and commit reservation
+            order["status"] = "completed"
+            await call_service(client, "PUT", f"{DATABASE_SERVICE_URL}/orders/{oid}", json=order)
+
+            if reservation_id:
+                # commit reservation (optional: inventory already decremented on reserve)
+                # don't let commit failure (rare) crash the happy path; log if needed
+                try:
+                    await call_service(client, "POST", f"{INVENTORY_SERVICE_URL}/reservations/{reservation_id}/commit")
+                except httpx.HTTPStatusError:
+                    # best-effort: log or ignore - order completed
+                    pass
+
+    except HTTPException:
+        # Re-raise HTTPExceptions we intentionally raised above (this preserves status/detail)
+        raise
+    except Exception as e:
+        # fallback behavior — mark order cancelled, release reservation if created
+        order["status"] = "cancelled"
+        async with httpx.AsyncClient() as client:
+            try:
+                await call_service(client, "PUT", f"{DATABASE_SERVICE_URL}/orders/{oid}", json=order)
+                if reservation_id:
+                    try:
+                        await call_service(client, "POST", f"{INVENTORY_SERVICE_URL}/reservations/{reservation_id}/release")
+                    except Exception:
+                        # ignore release failures (could be retried by background job)
+                        pass
+            except Exception:
+                # nothing more to do if DB update fails
+                pass
+        raise HTTPException(500, detail=f"Finalization failed: {e}")
+
     return order
 
 @app.get("/orders/{oid}", response_model=Order)
-def get_order(oid: str):
-    o = ORDERS.get(oid)
-    if not o:
-        raise HTTPException(404, detail="Order not found")
-    return o
+async def get_order(oid: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await call_service(client, "GET", f"{DATABASE_SERVICE_URL}/orders/{oid}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise HTTPException(404, detail="Order not found")
+            raise
+    return r
