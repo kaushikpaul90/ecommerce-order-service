@@ -13,10 +13,9 @@ app = FastAPI(title="Order Service")
 # PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://192.168.105.2:30003")
 # SHIPPING_SERVICE_URL = os.getenv("SHIPPING_URL", "http://192.168.105.2:30004")
 # DATABASE_SERVICE_URL = os.getenv("DATABASE_SERVICE_URL", "http://localhost:8000")
-
 INVENTORY_SERVICE_URL = os.getenv("INVENTORY_URL", "http://localhost:8006")
-PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://192.168.105.2:30003")
-SHIPPING_SERVICE_URL = os.getenv("SHIPPING_URL", "http://192.168.105.2:30004")
+PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://localhost:8005")
+SHIPPING_SERVICE_URL = os.getenv("SHIPPING_URL", "http://localhost:8007")
 DATABASE_SERVICE_URL = os.getenv("DATABASE_SERVICE_URL", "http://localhost:8000")
 
 class Address(BaseModel):
@@ -93,7 +92,7 @@ async def create_order(payload: CreateOrderRequest, x_idempotency_key: Optional[
             "city": payload.address.city if payload.address and hasattr(payload.address, "city") else "",
             "country": getattr(payload.address, "country", "IN") or "IN",
             "postalCode": getattr(payload.address, "postalCode", "") or "",
-            "zipcode": getattr(payload.address, "postalCode", "") or "",  # keep for backward compatibility
+            "zipcode": getattr(payload.address, "postalCode", "") or "",  # backward compatibility
         },
         "items": [it.dict() for it in payload.items],
         "total": sum(it.qty * it.price for it in payload.items),
@@ -109,63 +108,161 @@ async def create_order(payload: CreateOrderRequest, x_idempotency_key: Optional[
         IDEMPOTENCY[x_idempotency_key] = oid
 
     reservation_id = None
+    payment_id = None
+    shipment_id = None
 
     # attempt to finalize: reserve inventory, process payment, create shipment
     try:
         async with httpx.AsyncClient() as client:
-            # Reserve inventory — inventory service returns the reservation (with id)
+            # 1) Reserve inventory
             inv_payload = {"orderId": oid, "items": [it.dict() for it in payload.items]}
             try:
                 inv_resp = await call_service(client, "POST", f"{INVENTORY_SERVICE_URL}/reserve", json=inv_payload)
                 reservation_id = inv_resp.get("id") if isinstance(inv_resp, dict) else None
             except httpx.HTTPStatusError as e:
-                # Upstream returned non-2xx (e.g. 409 Conflict for insufficient stock)
                 status = e.response.status_code if e.response is not None else 502
                 try:
                     upstream_detail = e.response.json().get("detail", e.response.text) if e.response is not None else str(e)
                 except Exception:
                     upstream_detail = e.response.text if e.response is not None else str(e)
 
-                # Cancel the order in DB (best-effort)
+                # Cancel the order in DB
                 order["status"] = "cancelled"
                 try:
                     await call_service(client, "PUT", f"{DATABASE_SERVICE_URL}/orders/{oid}", json=order)
                 except Exception:
-                    # ignore DB update failures here to avoid masking upstream error
                     pass
 
-                # Propagate client errors (4xx) as-is to the API caller
                 if 400 <= status < 500:
                     raise HTTPException(status_code=status, detail=upstream_detail)
-                # For upstream 5xx, return 502 Bad Gateway
                 raise HTTPException(status_code=502, detail=f"Upstream error from inventory service: {upstream_detail}")
 
-            # Process payment
+            # 2) Process payment
             pay_payload = {"id": str(uuid.uuid4()), "order_id": oid, "amount": order["total"], "status": "pending"}
-            await call_service(client, "POST", f"{PAYMENT_SERVICE_URL}/payments", json=pay_payload)
+            try:
+                pay_resp = await call_service(client, "POST", f"{PAYMENT_SERVICE_URL}/payments", json=pay_payload)
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response is not None else 502
+                try:
+                    upstream_detail = e.response.json().get("detail", e.response.text) if e.response is not None else str(e)
+                except Exception:
+                    upstream_detail = e.response.text if e.response is not None else str(e)
 
-            # Create shipment
+                # Cancel order and release reservation
+                order["status"] = "cancelled"
+                try:
+                    await call_service(client, "PUT", f"{DATABASE_SERVICE_URL}/orders/{oid}", json=order)
+                except Exception:
+                    pass
+                if reservation_id:
+                    try:
+                        await call_service(client, "POST", f"{INVENTORY_SERVICE_URL}/reservations/{reservation_id}/release")
+                    except Exception:
+                        pass
+
+                if 400 <= status < 500:
+                    raise HTTPException(status_code=status, detail=upstream_detail)
+                raise HTTPException(status_code=502, detail=f"Upstream error from payment service: {upstream_detail}")
+
+            # If payment succeeded, capture payment id and ensure business-success
+            if isinstance(pay_resp, dict):
+                pstatus = pay_resp.get("status", "").lower()
+                payment_id = pay_resp.get("id")
+                # a payment response with non-success business state -> treat as failure
+                if pstatus not in ("completed", "success"):
+                    # cancel and release reservation
+                    order["status"] = "cancelled"
+                    try:
+                        await call_service(client, "PUT", f"{DATABASE_SERVICE_URL}/orders/{oid}", json=order)
+                    except Exception:
+                        pass
+                    if reservation_id:
+                        try:
+                            await call_service(client, "POST", f"{INVENTORY_SERVICE_URL}/reservations/{reservation_id}/release")
+                        except Exception:
+                            pass
+                    # surface payment failure
+                    raise HTTPException(status_code=402, detail=pay_resp.get("detail", f"Payment failed (status={pstatus})"))
+
+            # 3) Create shipment
             ship_payload = {"id": str(uuid.uuid4()), "order_id": oid, "address": payload.address.dict(), "items": [it.dict() for it in payload.items], "status": "created"}
-            await call_service(client, "POST", f"{SHIPPING_SERVICE_URL}/shipments", json=ship_payload)
+            try:
+                ship_resp = await call_service(client, "POST", f"{SHIPPING_SERVICE_URL}/shipments", json=ship_payload)
+                shipment_id = ship_resp.get("id") if isinstance(ship_resp, dict) else ship_payload["id"]
+            except httpx.HTTPStatusError as e:
+                # Shipping returned a client/server error. We must refund and cleanup.
+                status = e.response.status_code if e.response is not None else 502
+                try:
+                    upstream_detail = e.response.json().get("detail", e.response.text) if e.response is not None else str(e)
+                except Exception:
+                    upstream_detail = e.response.text if e.response is not None else str(e)
 
-            # All succeeded -> mark order completed and commit reservation
+                # Attempt refund/void immediately (best-effort)
+                refund_success = False
+                refund_error = None
+                if payment_id:
+                    try:
+                        # call refund endpoint on Payment service (idempotent)
+                        await call_service(client, "POST", f"{PAYMENT_SERVICE_URL}/payments/{payment_id}/refund")
+                        refund_success = True
+                    except httpx.HTTPStatusError as re:
+                        # Upstream payment responded with non-2xx on refund
+                        try:
+                            refund_error = re.response.json().get("detail", re.response.text)
+                        except Exception:
+                            refund_error = re.response.text if re.response is not None else str(re)
+                    except Exception as re:
+                        refund_error = str(re)
+
+                # Mark order cancelled/failed_shipping in DB and record refund attempt info (best-effort)
+                order["status"] = "failed_shipping"
+                if payment_id:
+                    order["paymentIntentId"] = payment_id
+                    # for clarity store a flag / message (your DB schema can accept it into address or additional fields)
+                    # We'll attempt to store refund outcome in the order JSON as additional keys:
+                    order["refund_attempt"] = {"success": refund_success, "error": refund_error}
+
+                try:
+                    await call_service(client, "PUT", f"{DATABASE_SERVICE_URL}/orders/{oid}", json=order)
+                except Exception:
+                    pass
+
+                # Release reservation if present (best-effort)
+                if reservation_id:
+                    try:
+                        await call_service(client, "POST", f"{INVENTORY_SERVICE_URL}/reservations/{reservation_id}/release")
+                    except Exception:
+                        pass
+
+                # Build a helpful error for caller
+                if refund_success:
+                    detail = f"Shipping failed: {upstream_detail}. Payment refunded."
+                else:
+                    detail = f"Shipping failed: {upstream_detail}. Refund attempt failed: {refund_error}. Manual reconciliation required."
+
+                # Return 502 Bad Gateway (or 424 Failed Dependency if you prefer)
+                raise HTTPException(status_code=502, detail=detail)
+
+            # 4) All succeeded -> mark order completed and commit reservation
             order["status"] = "completed"
+            if payment_id:
+                order["paymentIntentId"] = payment_id
+            if shipment_id:
+                order["shipmentId"] = shipment_id
+
             await call_service(client, "PUT", f"{DATABASE_SERVICE_URL}/orders/{oid}", json=order)
 
             if reservation_id:
-                # commit reservation (optional: inventory already decremented on reserve)
-                # don't let commit failure (rare) crash the happy path; log if needed
                 try:
                     await call_service(client, "POST", f"{INVENTORY_SERVICE_URL}/reservations/{reservation_id}/commit")
-                except httpx.HTTPStatusError:
-                    # best-effort: log or ignore - order completed
+                except Exception:
                     pass
 
     except HTTPException:
-        # Re-raise HTTPExceptions we intentionally raised above (this preserves status/detail)
+        # re-raise intentionally thrown HTTPExceptions
         raise
     except Exception as e:
-        # fallback behavior — mark order cancelled, release reservation if created
+        # fallback behavior
         order["status"] = "cancelled"
         async with httpx.AsyncClient() as client:
             try:
@@ -174,10 +271,14 @@ async def create_order(payload: CreateOrderRequest, x_idempotency_key: Optional[
                     try:
                         await call_service(client, "POST", f"{INVENTORY_SERVICE_URL}/reservations/{reservation_id}/release")
                     except Exception:
-                        # ignore release failures (could be retried by background job)
+                        pass
+                # best-effort refund if payment created but shipping not attempted / failed earlier
+                if payment_id:
+                    try:
+                        await call_service(client, "POST", f"{PAYMENT_SERVICE_URL}/payments/{payment_id}/refund")
+                    except Exception:
                         pass
             except Exception:
-                # nothing more to do if DB update fails
                 pass
         raise HTTPException(500, detail=f"Finalization failed: {e}")
 
