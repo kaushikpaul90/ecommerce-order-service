@@ -9,14 +9,14 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 app = FastAPI(title="Order Service")
 
 # Config via environment variables
-# INVENTORY_SERVICE_URL = os.getenv("INVENTORY_URL", "http://192.168.105.2:30002")
-# PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://192.168.105.2:30003")
-# SHIPPING_SERVICE_URL = os.getenv("SHIPPING_URL", "http://192.168.105.2:30004")
+INVENTORY_SERVICE_URL = os.getenv("INVENTORY_URL", "http://192.168.105.2:30002")
+PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://192.168.105.2:30003")
+SHIPPING_SERVICE_URL = os.getenv("SHIPPING_URL", "http://192.168.105.2:30004")
+DATABASE_SERVICE_URL = os.getenv("DATABASE_SERVICE_URL", "http://192.168.105.2:30000")
+# INVENTORY_SERVICE_URL = os.getenv("INVENTORY_URL", "http://localhost:8006")
+# PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://localhost:8005")
+# SHIPPING_SERVICE_URL = os.getenv("SHIPPING_URL", "http://localhost:8007")
 # DATABASE_SERVICE_URL = os.getenv("DATABASE_SERVICE_URL", "http://localhost:8000")
-INVENTORY_SERVICE_URL = os.getenv("INVENTORY_URL", "http://localhost:8006")
-PAYMENT_SERVICE_URL = os.getenv("PAYMENT_URL", "http://localhost:8005")
-SHIPPING_SERVICE_URL = os.getenv("SHIPPING_URL", "http://localhost:8007")
-DATABASE_SERVICE_URL = os.getenv("DATABASE_SERVICE_URL", "http://localhost:8000")
 
 class Address(BaseModel):
     line1: str
