@@ -246,7 +246,7 @@ async def create_order(payload: CreateOrderRequest, x_idempotency_key: Optional[
             # 4) All succeeded -> mark order completed and commit reservation
             order["status"] = "completed"
             if reservation_id:
-                order["inventoryId"] = reservation_id
+                order["reservationId"] = reservation_id
             if payment_id:
                 order["paymentIntentId"] = payment_id
             if shipment_id:
