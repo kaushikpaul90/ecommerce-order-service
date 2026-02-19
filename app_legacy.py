@@ -75,6 +75,10 @@ async def call_service(client: httpx.AsyncClient, method: str, url: str, json: A
 
 @app.post("/orders", response_model=Order, status_code=201)
 async def create_order(payload: CreateOrderRequest, x_idempotency_key: Optional[str] = Header(None)):
+    apply_failure_mode(settings.FAILURE_MODE)
+
+    logger.info("Order received", extra={"item": order.item})
+
     # Idempotency check (simple in-memory)
     if x_idempotency_key and x_idempotency_key in IDEMPOTENCY:
         oid = IDEMPOTENCY[x_idempotency_key]
